@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
-use log::debug;
+use log::{debug, info};
+use tokio::io::AsyncWriteExt;
 
 use crate::hdfs::datanode::{BlockReader, BlockWriter};
 use crate::hdfs::ec::EcSchema;
@@ -180,7 +181,7 @@ impl FileWriter {
         // If the current writer is full, close it
         if let Some(block_writer) = self.block_writer.as_mut() {
             if block_writer.is_full() {
-                block_writer.close().await?;
+                block_writer.shutdown().await?;
                 self.block_writer = Some(self.create_block_writer().await?);
             }
         }
@@ -198,10 +199,15 @@ impl FileWriter {
         // Create a shallow copy of the bytes instance to mutate and track what's been read
         while !buf.is_empty() {
             let block_writer = self.get_block_writer().await?;
+            let bytes_to_write = usize::min(block_writer.remaining(), buf.len());
 
-            block_writer.write(&mut buf).await?;
+            info!("Writing {} bytes to file", buf.len());
+            block_writer
+                .write_all(&buf.split_to(bytes_to_write))
+                .await?;
         }
 
+        info!("Finished writing");
         self.bytes_written += bytes_to_write;
 
         Ok(bytes_to_write)
@@ -210,7 +216,7 @@ impl FileWriter {
     pub async fn close(&mut self) -> Result<()> {
         if !self.closed {
             if let Some(block_writer) = self.block_writer.as_mut() {
-                block_writer.close().await?;
+                block_writer.shutdown().await?;
             }
             self.protocol
                 .complete(

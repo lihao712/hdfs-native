@@ -48,3 +48,12 @@ pub enum HdfsError {
 }
 
 pub type Result<T> = std::result::Result<T, HdfsError>;
+
+impl From<HdfsError> for std::io::Error {
+    fn from(value: HdfsError) -> Self {
+        match value {
+            HdfsError::IOError(inner) => inner,
+            e => std::io::Error::from(e),
+        }
+    }
+}

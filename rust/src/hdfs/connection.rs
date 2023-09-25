@@ -401,9 +401,10 @@ impl Packet {
         chunks
     }
 
-    pub(crate) fn write(&mut self, buf: &mut Bytes) {
-        self.data
-            .put(buf.split_to(usize::min(self.max_data_size - self.data.len(), buf.len())));
+    pub(crate) fn write(&mut self, buf: &[u8]) -> usize {
+        let bytes_to_write = usize::min(self.remaining(), buf.len());
+        self.data.put(&buf[..bytes_to_write]);
+        bytes_to_write
     }
 
     pub(crate) fn is_full(&self) -> bool {
@@ -412,6 +413,10 @@ impl Packet {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.max_data_size - self.data.len()
     }
 
     fn finalize(&mut self) -> (hdfs::PacketHeaderProto, Bytes, Bytes) {
@@ -526,7 +531,7 @@ impl DatanodeConnection {
     }
 
     /// Create a buffer to send to the datanode
-    pub(crate) async fn write_packet(&mut self, packet: &mut Packet) -> Result<()> {
+    pub(crate) async fn write_packet(&mut self, mut packet: Packet) -> Result<()> {
         let (header, checksum, data) = packet.finalize();
 
         let payload_len = (checksum.len() + data.len() + 4) as u32;
