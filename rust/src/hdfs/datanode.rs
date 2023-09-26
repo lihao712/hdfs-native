@@ -1,4 +1,8 @@
-use std::{collections::HashMap, pin::Pin, task::Poll};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{future::join_all, ready, Future};
@@ -319,6 +323,7 @@ enum BlockWriterState {
     Ready(DatanodeConnection, Packet),
     Busy(BoxedTryFuture<DatanodeConnection>),
     ShuttingDown(BoxedTryFuture<()>),
+    Closed,
     Error(String),
 }
 
@@ -438,27 +443,53 @@ impl BlockWriter {
 
     fn check_error(&mut self) -> Result<()> {
         match &self.state {
-            BlockWriterState::Error(msg) => return Err(HdfsError::DataTransferError(msg.to_string())),
-            _ => {
-                if let Some(status) = self.status.as_mut() {
-                match status.try_recv() {
-                    Ok(result) => result?,
-                    Err(oneshot::error::TryRecvError::Empty) => (),
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        self.state = BlockWriterState::Error("Status channel closed prematurely".to_string());
-                        return Err(HdfsError::DataTransferError(
-                            "Status channel closed prematurely".to_string(),
-                        ))
-                    }
+            BlockWriterState::Error(err) => {
+                return Err(HdfsError::DataTransferError(err.to_string()))
+            }
+            _ => (),
+        }
+        if let Some(status) = self.status.as_mut() {
+            match status.try_recv() {
+                Ok(result) => result?,
+                Err(oneshot::error::TryRecvError::Empty) => (),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.state =
+                        BlockWriterState::Error("Status channel closed prematurely".to_string());
+                    return Err(HdfsError::DataTransferError(
+                        "Status channel closed prematurely".to_string(),
+                    ));
                 }
-                Ok(())
-            } else {
-                return Err(HdfsError::DataTransferError(
-                    "Block writer is closed".to_string(),
-                ));
             }
         }
-        
+        Ok(())
+    }
+
+    fn poll_task(&mut self, cx: &mut Context) -> Poll<()> {
+        match &mut self.state {
+            BlockWriterState::Busy(task) => match Pin::new(task).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.state = match result {
+                        Ok(connection) => {
+                            BlockWriterState::Ready(connection, self.create_next_packet())
+                        }
+                        Err(e) => BlockWriterState::Error(e.to_string()),
+                    };
+                    Poll::Ready(())
+                }
+            },
+            BlockWriterState::ShuttingDown(task) => match Pin::new(task).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.state = match result {
+                        Ok(_) => BlockWriterState::Closed,
+                        Err(e) => BlockWriterState::Error(e.to_string()),
+                    };
+                    Poll::Ready(())
+                }
+            },
+            _ => Poll::Ready(()),
+        }
     }
 
     // pub(crate) async fn write(&mut self, buf: &mut Bytes) -> Result<()> {
@@ -584,52 +615,51 @@ impl AsyncWrite for BlockWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        info!("Trying to write {} bytes", buf.len());
         let this = self.get_mut();
+        ready!(this.poll_task(cx));
         this.check_error()?;
 
-        // If we are currently sending data, first check on that task
-        if let Some(task) = this.packet_send_task.as_mut() {
-            info!("Waiting for existing task");
-            this.connection = Some(ready!(Pin::new(task).poll(cx))?);
-            this.packet_send_task = None;
-        }
-
-        if this.current_packet.is_none() {
-            this.create_next_packet();
-        }
-
-        let packet = this.current_packet.as_mut().unwrap();
+        let mut bytes_written = 0;
         let bytes_left_in_block = this.block_size - this.bytes_written;
-        assert!(buf.len() <= bytes_left_in_block);
 
-        let bytes_written = packet.write(buf);
-        this.bytes_written += bytes_written;
+        if bytes_left_in_block == 0 {
+            Err(HdfsError::DataTransferError(
+                "Tried to write to a full block".to_string(),
+            ))?
+        }
 
-        if packet.is_full() {
-            let mut connection = this.connection.take().unwrap();
-            let packet = this.current_packet.take().unwrap();
-            let ack_sender = this.ack_queue_sender.clone();
-            let mut send_task: BoxedTryFuture<DatanodeConnection> = Box::pin(async move {
-                ack_sender
-                    .send((packet.header.seqno, false))
-                    .await
-                    .map_err(|_| {
-                        HdfsError::DataTransferError("Ack queue closed while writing".to_string())
-                    })?;
-                connection.write_packet(packet).await?;
-                Ok(connection)
-            });
-
-            match Pin::new(&mut send_task).poll(cx) {
-                Poll::Pending => {
-                    this.packet_send_task = Some(send_task);
-                }
-                Poll::Ready(connection) => {
-                    this.connection = Some(connection?);
+        this.state = match this.state {
+            BlockWriterState::Ready(connection, packet) => {
+                let bytes_to_write = usize::min(buf.len(), bytes_left_in_block);
+                bytes_written = packet.write(&buf[..bytes_to_write]);
+                if packet.is_full() {
+                    let ack_sender = this.ack_queue_sender.clone();
+                    let mut send_task: BoxedTryFuture<DatanodeConnection> = Box::pin(async move {
+                        ack_sender
+                            .send((packet.header.seqno, false))
+                            .await
+                            .map_err(|_| {
+                                HdfsError::DataTransferError(
+                                    "Ack queue closed while writing".to_string(),
+                                )
+                            })?;
+                        connection.write_packet(packet).await?;
+                        Ok(connection)
+                    });
+                    BlockWriterState::Busy(send_task)
+                } else {
+                    BlockWriterState::Ready(connection, packet)
                 }
             }
-        }
+            _ => Err(HdfsError::DataTransferError(
+                "Writer is not ready for writes".to_string(),
+            ))?,
+        };
+
+        this.bytes_written += bytes_written;
+
+        // Poll the potential new task so it can make progress
+        this.poll_task(cx);
 
         Poll::Ready(Ok(bytes_written))
     }
@@ -640,10 +670,8 @@ impl AsyncWrite for BlockWriter {
     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
         // Just wait for any existing write tasks, don't try to write a partial packet
         let this = self.get_mut();
-        if let Some(task) = this.packet_send_task.as_mut() {
-            this.connection = Some(ready!(Pin::new(task).poll(cx))?);
-            this.packet_send_task = None;
-        }
+        ready!(this.poll_task(cx));
+        this.check_error()?;
         Poll::Ready(Ok(()))
     }
 
@@ -651,14 +679,52 @@ impl AsyncWrite for BlockWriter {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::result::Result<(), std::io::Error>> {
-        info!("Shutdown called");
+        // First let any data currently being written finish
+        ready!(self.poll_flush(cx))?;
+
         let this = self.get_mut();
 
-        // First wait for any existing write task to finish
-        if let Some(task) = this.packet_send_task.as_mut() {
-            info!("Waiting for last task");
-            this.connection = Some(ready!(Pin::new(task).poll(cx))?);
-            this.packet_send_task = None;
+        match this.state {
+            BlockWriterState::Ready(connection, packet) => {
+                let ack_sender = this.ack_queue_sender.clone();
+                let mut shutdown_task: BoxedTryFuture<()> = Box::pin(async move {
+                    if !packet.is_empty() {
+                        ack_sender
+                            .send((packet.header.seqno, false))
+                            .await
+                            .map_err(|_| {
+                                HdfsError::DataTransferError(
+                                    "Ack queue closed while writing".to_string(),
+                                )
+                            })?;
+                        connection.write_packet(packet).await?;
+                    }
+
+                    let packet = this.create_next_packet();
+                    packet.set_last_packet();
+                    ack_sender
+                        .send((packet.header.seqno, true))
+                        .await
+                        .map_err(|_| {
+                            HdfsError::DataTransferError(
+                                "Ack queue closed while writing".to_string(),
+                            )
+                        })?;
+                    connection.write_packet(packet).await?;
+                    let _ = status.await.map_err(|_| {
+                        HdfsError::DataTransferError(
+                            "Status channel closed while waiting for final ack".to_string(),
+                        )
+                    })?;
+
+                    Ok(())
+                });
+
+                this.state = BlockWriterState::ShuttingDown(shutdown_task);
+            }
+            _ => Err(HdfsError::DataTransferError(
+                "Writer is not in a state to shutdown".to_string(),
+            ))?,
         }
 
         // Next send any remaining data in another packet
