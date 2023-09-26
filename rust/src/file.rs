@@ -201,13 +201,11 @@ impl FileWriter {
             let block_writer = self.get_block_writer().await?;
             let bytes_to_write = usize::min(block_writer.remaining(), buf.len());
 
-            info!("Writing {} bytes to file", buf.len());
             block_writer
                 .write_all(&buf.split_to(bytes_to_write))
                 .await?;
         }
 
-        info!("Finished writing");
         self.bytes_written += bytes_to_write;
 
         Ok(bytes_to_write)
