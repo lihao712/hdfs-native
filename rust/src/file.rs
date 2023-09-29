@@ -1,9 +1,12 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
-use log::{debug, info};
-use tokio::io::AsyncWriteExt;
+use futures::Future;
+use log::debug;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::hdfs::datanode::{BlockReader, BlockWriter};
 use crate::hdfs::ec::EcSchema;
@@ -136,12 +139,21 @@ impl FileReader {
     }
 }
 
+type BoxedTryFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + Sync + 'static>>;
+
+enum FileWriterState {
+    New,
+    Ready(BlockWriter),
+    LoadingBlock(BoxedTryFuture<BlockWriter>),
+    Error(String),
+}
+
 pub struct FileWriter {
     src: String,
     protocol: Arc<NamenodeProtocol>,
     status: hdfs::HdfsFileStatusProto,
     server_defaults: hdfs::FsServerDefaultsProto,
-    block_writer: Option<BlockWriter>,
+    state: FileWriterState,
     closed: bool,
     bytes_written: usize,
 }
@@ -158,28 +170,49 @@ impl FileWriter {
             src,
             status,
             server_defaults,
-            block_writer: None,
+            state: FileWriterState::New,
             closed: false,
             bytes_written: 0,
         }
     }
 
-    async fn create_block_writer(&self) -> Result<BlockWriter> {
-        let new_block = self
-            .protocol
-            .add_block(
-                &self.src,
-                self.block_writer.as_ref().map(|b| b.get_extended_block()),
-                self.status.file_id,
-            )
-            .await?;
+    fn load_block_task(
+        &self,
+        prev: Option<hdfs::ExtendedBlockProto>,
+    ) -> BoxedTryFuture<BlockWriter> {
+        let protocol = Arc::clone(&self.protocol);
+        let src = self.src.clone();
+        let file_id = self.status.file_id.clone();
+        let blocksize = self.status.blocksize() as usize;
+        let server_defaults = self.server_defaults.clone();
+        Box::pin(async move {
+            let new_block = protocol.add_block(&src, None, file_id).await?;
+            Ok(BlockWriter::new(new_block.block, blocksize, server_defaults).await?)
+        })
+    }
 
-        Ok(BlockWriter::new(
-            new_block.block,
-            self.status.blocksize() as usize,
-            self.server_defaults.clone(),
-        )
-        .await?)
+    fn create_block_writer(&mut self) -> Poll<Result<()>> {
+        self.state = match core::mem::replace(
+            &mut self.state,
+            FileWriterState::Error("Error occured during block creation".to_string()),
+        ) {
+            FileWriterState::New => FileWriterState::LoadingBlock(self.load_block_task(None)),
+            FileWriterState::Ready(block_writer) => FileWriterState::LoadingBlock(
+                self.load_block_task(Some(block_writer.get_extended_block())),
+            ),
+            _ => FileWriterState::Error(
+                "FileWriter in invalid state to create new block".to_string(),
+            ),
+        };
+        Poll::Ready(Ok(()))
+        // let new_block = self
+        //     .protocol
+        //     .add_block(
+        //         &self.src,
+        //         self.block_writer.as_ref().map(|b| b.get_extended_block()),
+        //         self.status.file_id,
+        //     )
+        //     .await?;
     }
 
     async fn get_block_writer(&mut self) -> Result<&mut BlockWriter> {
@@ -231,5 +264,53 @@ impl FileWriter {
             self.closed = true;
         }
         Ok(())
+    }
+}
+
+impl AsyncWrite for FileWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+
+        let mut bytes_written = 0usize;
+
+        this.state = match core::mem::replace(
+            &mut this.state,
+            FileWriterState::Error("Error occured during write".to_string()),
+        ) {
+            FileWriterState::Ready(mut block_writer) => {
+                match Pin::new(&mut block_writer).poll_write(cx, buf) {
+                    Poll::Ready(written) => {
+                        bytes_written = written?;
+                    }
+                    Poll::Pending => (),
+                }
+                FileWriterState::Ready(block_writer)
+            }
+            _ => FileWriterState::Error("FileWriter not ready for writes".to_string()),
+        };
+
+        if bytes_written > 0 {
+            Poll::Ready(Ok(bytes_written))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        todo!()
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), std::io::Error>> {
+        todo!()
     }
 }
