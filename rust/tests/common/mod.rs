@@ -372,7 +372,6 @@ async fn test_object_store_write_multipart(store: &HdfsObjectStore) -> object_st
     use bytes::Buf;
     use hdfs_native::HdfsError;
     use object_store::{path::Path, ObjectStore};
-    use tokio::io::AsyncWriteExt;
 
     let (_, mut writer) = store.put_multipart(&"/newfile".into()).await?;
     writer.shutdown().await.map_err(HdfsError::from)?;
