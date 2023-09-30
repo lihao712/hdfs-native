@@ -2,10 +2,7 @@ use std::{
     fmt::{Display, Formatter},
     future,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicUsize, Arc},
 };
 
 use crate::{client::FileStatus, file::FileWriter, Client, HdfsError, WriteOptions};
@@ -14,12 +11,10 @@ use bytes::Bytes;
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::{
-    multipart::{PartId, PutPart, WriteMultiPart},
-    path::Path,
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta, ObjectStore,
-    Result,
+    path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta,
+    ObjectStore, Result,
 };
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug)]
 pub struct HdfsObjectStore {
@@ -55,8 +50,11 @@ impl HdfsObjectStore {
             .create(&make_absolute_file(to), write_options)
             .await?;
 
-        new_file.write(data).await?;
-        new_file.close().await?;
+        new_file
+            .write_all(&data)
+            .await
+            .map_err(|e| HdfsError::from(e))?;
+        new_file.shutdown().await.map_err(|e| HdfsError::from(e))?;
 
         Ok(())
     }
@@ -108,8 +106,11 @@ impl ObjectStore for HdfsObjectStore {
         write_options.overwrite = overwrite;
 
         let mut writer = self.client.create(&tmp_filename, write_options).await?;
-        writer.write(bytes).await?;
-        writer.close().await?;
+        writer
+            .write_all(&bytes)
+            .await
+            .map_err(|e| HdfsError::from(e))?;
+        writer.shutdown().await.map_err(|e| HdfsError::from(e))?;
 
         self.client
             .rename(&tmp_filename, &final_file_path, true)
@@ -152,18 +153,7 @@ impl ObjectStore for HdfsObjectStore {
 
         let writer = self.client.create(&tmp_filename, write_options).await?;
 
-        Ok((
-            tmp_filename.clone(),
-            Box::new(WriteMultiPart::new(
-                HdfsMultipartWriter::new(
-                    Arc::clone(&self.client),
-                    writer,
-                    &tmp_filename,
-                    &final_file_path,
-                ),
-                1,
-            )),
-        ))
+        Ok((tmp_filename.clone(), Box::new(writer)))
     }
 
     /// Cleanup an aborted upload.
@@ -396,37 +386,6 @@ impl HdfsMultipartWriter {
             final_filename: final_filename.to_string(),
             next_part: AtomicUsize::new(0),
         }
-    }
-}
-
-#[async_trait]
-impl PutPart for HdfsMultipartWriter {
-    /// Upload a single part
-    async fn put_part(&self, buf: Vec<u8>, part_idx: usize) -> Result<PartId> {
-        if part_idx != self.next_part.load(Ordering::SeqCst) {
-            return Err(object_store::Error::NotSupported {
-                source: "Part received out of order".to_string().into(),
-            });
-        }
-
-        self.inner.lock().await.write(buf.into()).await?;
-
-        self.next_part.fetch_add(1, Ordering::SeqCst);
-
-        Ok(PartId {
-            content_id: part_idx.to_string(),
-        })
-    }
-
-    /// Complete the upload with the provided parts
-    ///
-    /// `completed_parts` is in order of part number
-    async fn complete(&self, _completed_parts: Vec<PartId>) -> Result<()> {
-        self.inner.lock().await.close().await?;
-        self.client
-            .rename(&self.tmp_filename, &self.final_filename, true)
-            .await?;
-        Ok(())
     }
 }
 

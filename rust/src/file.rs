@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
 use futures::{ready, Future};
 use log::debug;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 
 use crate::hdfs::datanode::{BlockReader, BlockWriter};
 use crate::hdfs::ec::EcSchema;
@@ -155,8 +155,8 @@ pub struct FileWriter {
     status: hdfs::HdfsFileStatusProto,
     server_defaults: hdfs::FsServerDefaultsProto,
     state: FileWriterState,
-    closed: bool,
-    bytes_written: usize,
+    // closed: bool,
+    // bytes_written: usize,
 }
 
 impl FileWriter {
@@ -172,30 +172,36 @@ impl FileWriter {
             status,
             server_defaults,
             state: FileWriterState::New,
-            closed: false,
-            bytes_written: 0,
+            // closed: false,
+            // bytes_written: 0,
         }
     }
 
-    fn load_block_task(&self, prev: Option<&BlockWriter>) -> BoxedTryFuture<BlockWriter> {
+    fn load_block_task(
+        &self,
+        prev: Option<hdfs::ExtendedBlockProto>,
+    ) -> BoxedTryFuture<BlockWriter> {
         let protocol = Arc::clone(&self.protocol);
         let src = self.src.clone();
         let file_id = self.status.file_id.clone();
         let blocksize = self.status.blocksize() as usize;
         let server_defaults = self.server_defaults.clone();
-        let extended_block = prev.map(|b| b.get_extended_block());
         Box::pin(async move {
-            let new_block = protocol.add_block(&src, extended_block, file_id).await?;
+            let new_block = protocol.add_block(&src, prev, file_id).await?;
             Ok(BlockWriter::new(new_block.block, blocksize, server_defaults).await?)
         })
     }
 
     fn poll_task(&mut self, cx: &mut Context) -> Poll<Result<()>> {
+        if let FileWriterState::New = self.state {
+            self.state = FileWriterState::LoadingBlock(self.load_block_task(None));
+        }
         match &mut self.state {
             FileWriterState::Ready(block_writer) => {
                 if block_writer.is_full() {
+                    let prev_block = block_writer.get_extended_block();
                     ready!(Pin::new(block_writer).poll_shutdown(cx))?;
-                    let mut task = self.load_block_task(Some(block_writer));
+                    let mut task = self.load_block_task(Some(prev_block));
                     // We need to immediately poll the task to register the context, and handle the case it immediately returns
                     match Pin::new(&mut task).poll(cx) {
                         Poll::Pending => {
@@ -233,7 +239,7 @@ impl AsyncWrite for FileWriter {
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
         let this = self.get_mut();
-        ready!(this.poll_task(cx));
+        ready!(this.poll_task(cx))?;
 
         let mut bytes_written = 0usize;
 
@@ -285,26 +291,44 @@ impl AsyncWrite for FileWriter {
             FileWriterState::New => {
                 // No data was written, just complete the file
                 let protocol = Arc::clone(&this.protocol);
-                let task: BoxedTryFuture<()> = Box::pin(async move {
-                    protocol
-                        .complete(&self.src, None, self.status.file_id)
-                        .await?;
+                let src = this.src.clone();
+                let file_id = this.status.file_id;
+                let mut task: BoxedTryFuture<()> = Box::pin(async move {
+                    protocol.complete(&src, None, file_id).await?;
                     Ok(())
                 });
-                this.state = FileWriterState::ShuttingDown(task)
+                match Pin::new(&mut task).poll(cx) {
+                    Poll::Pending => {
+                        this.state = FileWriterState::ShuttingDown(task);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(result) => {
+                        result?;
+                    }
+                }
             }
             FileWriterState::Ready(writer) => {
+                let extended_block = writer.get_extended_block();
                 ready!(Pin::new(writer).poll_shutdown(cx))?;
 
                 let protocol = Arc::clone(&this.protocol);
-                let extended_block = writer.get_extended_block();
-                let task: BoxedTryFuture<()> = Box::pin(async move {
+                let src = this.src.clone();
+                let file_id = this.status.file_id;
+                let mut task: BoxedTryFuture<()> = Box::pin(async move {
                     protocol
-                        .complete(&self.src, Some(extended_block), self.status.file_id)
+                        .complete(&src, Some(extended_block), file_id)
                         .await?;
                     Ok(())
                 });
-                this.state = FileWriterState::ShuttingDown(task)
+                match Pin::new(&mut task).poll(cx) {
+                    Poll::Pending => {
+                        this.state = FileWriterState::ShuttingDown(task);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(result) => {
+                        result?;
+                    }
+                }
             }
             FileWriterState::ShuttingDown(task) => {
                 ready!(Pin::new(task).poll(cx))?;

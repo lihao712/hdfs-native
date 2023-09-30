@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
+use tokio::io::AsyncWriteExt;
 use which::which;
 #[cfg(feature = "object_store")]
 use {bytes::Bytes, hdfs_native::object_store::HdfsObjectStore};
@@ -146,7 +147,7 @@ async fn test_write(client: &Client) -> Result<()> {
     // Create an empty file
     let mut writer = client.create("/newfile", write_options.clone()).await?;
 
-    writer.close().await?;
+    writer.shutdown().await?;
 
     assert_eq!(client.get_file_info("/newfile").await?.length, 0);
 
@@ -166,8 +167,8 @@ async fn test_write(client: &Client) -> Result<()> {
 
         let buf = data.freeze();
 
-        writer.write(buf.clone()).await?;
-        writer.close().await?;
+        writer.write_all(&buf.clone()).await?;
+        writer.shutdown().await?;
 
         assert_eq!(
             client.get_file_info("/newfile").await?.length,
@@ -199,17 +200,17 @@ async fn test_recursive_listing(client: &Client) -> Result<()> {
     client
         .create("/dir/file1", write_options.clone())
         .await?
-        .close()
+        .shutdown()
         .await?;
     client
         .create("/dir/nested/file2", write_options.clone())
         .await?
-        .close()
+        .shutdown()
         .await?;
     client
         .create("/dir/nested/file3", write_options.clone())
         .await?
-        .close()
+        .shutdown()
         .await?;
 
     let statuses = client.list_status("/dir", true).await?;
