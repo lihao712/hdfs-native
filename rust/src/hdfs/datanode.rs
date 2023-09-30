@@ -419,10 +419,6 @@ impl BlockWriter {
         self.bytes_written == self.block_size
     }
 
-    pub(crate) fn remaining(&self) -> usize {
-        self.block_size - self.bytes_written
-    }
-
     fn create_next_packet(&mut self) -> Packet {
         let packet = Packet::empty(
             self.bytes_written as i64,
