@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use futures::future::join_all;
-use futures::Future;
+use futures::{ready, Future};
 use log::debug;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -145,6 +145,7 @@ enum FileWriterState {
     New,
     Ready(BlockWriter),
     LoadingBlock(BoxedTryFuture<BlockWriter>),
+    ShuttingDown(BoxedTryFuture<()>),
     Error(String),
 }
 
@@ -176,94 +177,52 @@ impl FileWriter {
         }
     }
 
-    fn load_block_task(
-        &self,
-        prev: Option<hdfs::ExtendedBlockProto>,
-    ) -> BoxedTryFuture<BlockWriter> {
+    fn load_block_task(&self, prev: Option<&BlockWriter>) -> BoxedTryFuture<BlockWriter> {
         let protocol = Arc::clone(&self.protocol);
         let src = self.src.clone();
         let file_id = self.status.file_id.clone();
         let blocksize = self.status.blocksize() as usize;
         let server_defaults = self.server_defaults.clone();
+        let extended_block = prev.map(|b| b.get_extended_block());
         Box::pin(async move {
-            let new_block = protocol.add_block(&src, None, file_id).await?;
+            let new_block = protocol.add_block(&src, extended_block, file_id).await?;
             Ok(BlockWriter::new(new_block.block, blocksize, server_defaults).await?)
         })
     }
 
-    fn create_block_writer(&mut self) -> Poll<Result<()>> {
-        self.state = match core::mem::replace(
-            &mut self.state,
-            FileWriterState::Error("Error occured during block creation".to_string()),
-        ) {
-            FileWriterState::New => FileWriterState::LoadingBlock(self.load_block_task(None)),
-            FileWriterState::Ready(block_writer) => FileWriterState::LoadingBlock(
-                self.load_block_task(Some(block_writer.get_extended_block())),
-            ),
-            _ => FileWriterState::Error(
-                "FileWriter in invalid state to create new block".to_string(),
-            ),
-        };
-        Poll::Ready(Ok(()))
-        // let new_block = self
-        //     .protocol
-        //     .add_block(
-        //         &self.src,
-        //         self.block_writer.as_ref().map(|b| b.get_extended_block()),
-        //         self.status.file_id,
-        //     )
-        //     .await?;
-    }
-
-    async fn get_block_writer(&mut self) -> Result<&mut BlockWriter> {
-        // If the current writer is full, close it
-        if let Some(block_writer) = self.block_writer.as_mut() {
-            if block_writer.is_full() {
-                block_writer.shutdown().await?;
-                self.block_writer = Some(self.create_block_writer().await?);
+    fn poll_task(&mut self, cx: &mut Context) -> Poll<Result<()>> {
+        match &mut self.state {
+            FileWriterState::Ready(block_writer) => {
+                if block_writer.is_full() {
+                    ready!(Pin::new(block_writer).poll_shutdown(cx))?;
+                    let mut task = self.load_block_task(Some(block_writer));
+                    // We need to immediately poll the task to register the context, and handle the case it immediately returns
+                    match Pin::new(&mut task).poll(cx) {
+                        Poll::Pending => {
+                            self.state = FileWriterState::LoadingBlock(task);
+                            Poll::Pending
+                        }
+                        Poll::Ready(new_writer) => {
+                            self.state = FileWriterState::Ready(new_writer?);
+                            Poll::Ready(Ok(()))
+                        }
+                    }
+                } else {
+                    Poll::Ready(Ok(()))
+                }
             }
+            FileWriterState::LoadingBlock(task) => match Pin::new(task).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => {
+                    self.state = match result {
+                        Ok(block_writer) => FileWriterState::Ready(block_writer),
+                        Err(e) => FileWriterState::Error(e.to_string()),
+                    };
+                    Poll::Ready(Ok(()))
+                }
+            },
+            _ => Poll::Ready(Ok(())),
         }
-
-        // If we haven't created a writer yet, create one
-        if self.block_writer.is_none() {
-            self.block_writer = Some(self.create_block_writer().await?);
-        }
-
-        Ok(self.block_writer.as_mut().unwrap())
-    }
-
-    pub async fn write(&mut self, mut buf: Bytes) -> Result<usize> {
-        let bytes_to_write = buf.len();
-        // Create a shallow copy of the bytes instance to mutate and track what's been read
-        while !buf.is_empty() {
-            let block_writer = self.get_block_writer().await?;
-            let bytes_to_write = usize::min(block_writer.remaining(), buf.len());
-
-            block_writer
-                .write_all(&buf.split_to(bytes_to_write))
-                .await?;
-        }
-
-        self.bytes_written += bytes_to_write;
-
-        Ok(bytes_to_write)
-    }
-
-    pub async fn close(&mut self) -> Result<()> {
-        if !self.closed {
-            if let Some(block_writer) = self.block_writer.as_mut() {
-                block_writer.shutdown().await?;
-            }
-            self.protocol
-                .complete(
-                    &self.src,
-                    self.block_writer.as_ref().map(|b| b.get_extended_block()),
-                    self.status.file_id,
-                )
-                .await?;
-            self.closed = true;
-        }
-        Ok(())
     }
 }
 
@@ -274,6 +233,7 @@ impl AsyncWrite for FileWriter {
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
         let this = self.get_mut();
+        ready!(this.poll_task(cx));
 
         let mut bytes_written = 0usize;
 
@@ -304,13 +264,57 @@ impl AsyncWrite for FileWriter {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        todo!()
+        // Push to the block writer if one currently exists, otherwise ignore
+        let this = self.get_mut();
+
+        match &mut this.state {
+            FileWriterState::Ready(writer) => {
+                Poll::Ready(Ok(ready!(Pin::new(writer).poll_flush(cx))?))
+            }
+            _ => Poll::Ready(Ok(())),
+        }
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        todo!()
+        let this = self.get_mut();
+
+        match &mut this.state {
+            FileWriterState::New => {
+                // No data was written, just complete the file
+                let protocol = Arc::clone(&this.protocol);
+                let task: BoxedTryFuture<()> = Box::pin(async move {
+                    protocol
+                        .complete(&self.src, None, self.status.file_id)
+                        .await?;
+                    Ok(())
+                });
+                this.state = FileWriterState::ShuttingDown(task)
+            }
+            FileWriterState::Ready(writer) => {
+                ready!(Pin::new(writer).poll_shutdown(cx))?;
+
+                let protocol = Arc::clone(&this.protocol);
+                let extended_block = writer.get_extended_block();
+                let task: BoxedTryFuture<()> = Box::pin(async move {
+                    protocol
+                        .complete(&self.src, Some(extended_block), self.status.file_id)
+                        .await?;
+                    Ok(())
+                });
+                this.state = FileWriterState::ShuttingDown(task)
+            }
+            FileWriterState::ShuttingDown(task) => {
+                ready!(Pin::new(task).poll(cx))?;
+            }
+
+            _ => Err(HdfsError::DataTransferError(
+                "File writer not in a state to shutdown".to_string(),
+            ))?,
+        }
+
+        Poll::Ready(Ok(()))
     }
 }
