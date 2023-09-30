@@ -142,7 +142,7 @@ impl ObjectStore for HdfsObjectStore {
             .to_string();
 
         // First we need to check if the tmp file exists so we know whether to overwrite
-        let overwrite = match self.client.get_file_info(&tmp_filename).await {
+        let overwrite = match self.client.get_file_info(&final_file_path).await {
             Ok(_) => true,
             Err(HdfsError::FileNotFound(_)) => false,
             Err(e) => Err(e)?,
@@ -151,9 +151,9 @@ impl ObjectStore for HdfsObjectStore {
         let mut write_options = WriteOptions::default();
         write_options.overwrite = overwrite;
 
-        let writer = self.client.create(&tmp_filename, write_options).await?;
+        let writer = self.client.create(&final_file_path, write_options).await?;
 
-        Ok((tmp_filename.clone(), Box::new(writer)))
+        Ok((final_file_path.clone(), Box::new(writer)))
     }
 
     /// Cleanup an aborted upload.
