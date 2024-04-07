@@ -82,7 +82,7 @@ export CLASSPATH=$(hadoop classpath)
 
 then you can run the benchmarks with
 ```bash
-cargo bench -p hdfs-native --features benchmark
+cargo bench -p hdfs-native --features kerberos,benchmark
 ```
 
 The `benchmark` feature is required to expose `minidfs` and the internal erasure coding functions to benchmark.
