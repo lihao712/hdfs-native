@@ -1,0 +1,40 @@
+[package]
+name = "hdfs-native-deltalake"
+version = "0.1.0"
+edition = "2021"
+authors = ["Adam Binford <adamq43@gmail.com>"]
+homepage = "https://github.com/Kimahriman/hdfs-native"
+repository = "https://github.com/Kimahriman/hdfs-native"
+keywords = ["hadoop", "hdfs", "object_store"]
+description = "object_store implementation for Native HDFS client"
+readme = "../../README.md"
+license = "Apache-2.0"
+
+[dependencies]
+deltalake-core = { version = "0.17" }
+lazy_static = "1"
+
+# workspace depenndecies
+# async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+# tracing = { workspace = true }
+hdfs-native = { path = "../hdfs-native", version = "0.9" }
+hdfs-native-object-store = { path = "../hdfs-native-object-store", version = "0.9" }
+object_store = "0.9"
+thiserror = { workspace = true }
+url = "2"
+tokio = { workspace = true }
+# regex = { workspace = true }
+# url = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+serial_test = "3"
+deltalake-test = { git = "https://github.com/delta-io/delta-rs", rev = "rust-v0.17.1"}
+pretty_env_logger = "0.5.0"
+rand = "0.8"
+# serde_json = { workspace = true }
+
+[features]
+integration_test = ["hdfs-native/integration-test"]
