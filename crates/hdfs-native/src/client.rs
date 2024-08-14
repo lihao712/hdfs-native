@@ -279,11 +279,6 @@ impl Client {
                     None
                 };
 
-                if status.blocksize.is_some() {
-                    let locations = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap()).await?;
-                    eprintln!("locations is: {:#?}", &locations);
-                }
-
                 if status.file_encryption_info.is_some() {
                     return Err(HdfsError::UnsupportedFeature("File encryption".to_string()));
                 }
@@ -292,6 +287,15 @@ impl Client {
                 }
 
                 if let Some(locations) = status.locations.take() {
+                    Ok(FileReader::new(
+                        Arc::clone(&link.protocol),
+                        status,
+                        locations,
+                        ec_schema,
+                    ))
+                } else if status.blocksize.is_some() {
+                    let locations = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap()).await?;
+                    eprintln!("locations is: {:#?}", &locations);
                     Ok(FileReader::new(
                         Arc::clone(&link.protocol),
                         status,
