@@ -272,6 +272,7 @@ impl Client {
         let located_info = link.protocol.get_file_info(&resolved_path).await?;
         match located_info.fs {
             Some(mut status) => {
+                eprintln!("status is: {:#?}", &status);
                 let ec_schema = if let Some(ec_policy) = status.ec_policy.as_ref() {
                     Some(resolve_ec_policy(ec_policy)?)
                 } else {
