@@ -294,14 +294,19 @@ impl Client {
                         ec_schema,
                     ))
                 } else if status.blocksize.is_some() {
-                    let locations = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap()).await?;
-                    eprintln!("locations is: {:#?}", &locations);
-                    Ok(FileReader::new(
-                        Arc::clone(&link.protocol),
-                        status,
-                        locations,
-                        ec_schema,
-                    ))
+                    let loc = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap()).await?;
+                    match loc.locations {
+                        Some(located_blocks) => {
+                            eprintln!("locations is: {:#?}", &located_blocks);
+                            Ok(FileReader::new(
+                                Arc::clone(&link.protocol),
+                                status,
+                                located_blocks,
+                                ec_schema,
+                            ))
+                        },
+                        None => Err(HdfsError::BlocksNotFound(path.to_string()))
+                    }
                 } else {
                     Err(HdfsError::BlocksNotFound(path.to_string()))
                 }
