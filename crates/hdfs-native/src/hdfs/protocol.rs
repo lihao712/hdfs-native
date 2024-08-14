@@ -65,6 +65,23 @@ impl NamenodeProtocol {
         Ok(decoded)
     }
 
+    pub(crate) async fn get_block_locations(&self, src: &str, offset: u64, length: u64) -> Result<hdfs::GetBlockLocationsResponseProto> {
+        let message = hdfs::GetBlockLocationsRequestProto {
+            src: src.to_string(),
+            offset,
+            length,
+        };
+        eprintln!("get_block_locations request: {:?}", &message);
+
+        let response = self
+            .proxy
+            .call("getBlockLocations", message.encode_length_delimited_to_vec())
+            .await?;
+        let decoded = hdfs::GetBlockLocationsResponseProto::decode_length_delimited(response)?;
+        eprintln!("get_block_locations response: {:?}", &decoded);
+        Ok(decoded)
+    }
+
     pub(crate) async fn get_listing(
         &self,
         src: &str,

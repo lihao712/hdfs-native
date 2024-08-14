@@ -279,6 +279,11 @@ impl Client {
                     None
                 };
 
+                if status.blocksize.is_some() {
+                    let locations = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap()).await?;
+                    eprintln!("locations is: {:#?}", &locations);
+                }
+
                 if status.file_encryption_info.is_some() {
                     return Err(HdfsError::UnsupportedFeature("File encryption".to_string()));
                 }
