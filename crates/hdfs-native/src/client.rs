@@ -294,7 +294,7 @@ impl Client {
                         ec_schema,
                     ))
                 } else if status.blocksize.is_some() {
-                    let loc = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap()).await?;
+                    let loc = link.protocol.get_block_locations(&resolved_path, 0, status.blocksize.unwrap() * 10).await?;
                     match loc.locations {
                         Some(located_blocks) => {
                             eprintln!("locations is: {:#?}", &located_blocks);
