@@ -52,7 +52,7 @@ impl NamenodeProtocol {
         let message = hdfs::GetFileInfoRequestProto {
             src: src.to_string(),
         };
-        debug!("get_file_info request: {:?}", &message);
+        eprintln!("get_file_info request: {:?}", &message);
 
         let response = self
             .proxy
@@ -60,7 +60,7 @@ impl NamenodeProtocol {
             .await?;
 
         let decoded = hdfs::GetFileInfoResponseProto::decode_length_delimited(response)?;
-        debug!("get_file_info response: {:?}", &decoded);
+        eprintln!("get_file_info response: {:?}", &decoded);
 
         Ok(decoded)
     }
